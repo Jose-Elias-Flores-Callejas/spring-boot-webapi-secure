@@ -105,7 +105,6 @@ jobs:
   sca-dependency-check:
     name: SCA - OWASP Dependency-Check
     runs-on: ubuntu-latest
-    if: env.SKIP_SCA != 'true'
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
