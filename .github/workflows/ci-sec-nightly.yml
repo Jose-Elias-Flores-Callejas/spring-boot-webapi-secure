@@ -113,23 +113,29 @@ jobs:
           distribution: 'temurin'
           cache: maven
 
-      - name: Run OWASP Dependency-Check
+      - name: Run OWASP Dependency-Check (strict, CVSS >= 7 fails)
+        id: odccheck
+        continue-on-error: true
         run: |
           mvn -B org.owasp:dependency-check-maven:check \
               -DfailBuildOnCVSS=7 \
-              -DsuppressionFile=dependency-check-suppressions.xml || true
-        # Remove "|| true" once you have suppressions in place and want hard fails
+              -Dformats=HTML,JSON,XML \
+              -DsuppressionFile=dependency-check-suppressions.xml
+          echo "exit_code=$?" >> "$GITHUB_OUTPUT"
 
       - name: Upload Dependency-Check report
         uses: actions/upload-artifact@v4
         if: always()
         with:
           name: dependency-check-report
-          path: target/dependency-check-report.html
+          path: |
+            target/dependency-check-report.html
+            target/dependency-check-report.json
+            target/dependency-check-report.xml
           retention-days: 14
 
   # ------------------------------------------------------------------
-  # 4. Optional: SpotBugs + PMD (static analysis)
+  # 4. SpotBugs + PMD (static analysis, JDK 21: SpotBugs ASM compat)
   # ------------------------------------------------------------------
   static-analysis:
     name: Static Analysis (SpotBugs + PMD)
@@ -138,18 +144,21 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
 
-      - name: Set up JDK
+      - name: Set up JDK 21 for SpotBugs
         uses: actions/setup-java@v4
         with:
-          java-version: ${{ env.JAVA_VERSION }}
+          java-version: '21'
           distribution: 'temurin'
           cache: maven
 
-      - name: Run SpotBugs & PMD
+      - name: Run SpotBugs & PMD (strict)
+        id: spotbugs
+        continue-on-error: true
         run: |
           mvn -B clean compile \
               com.github.spotbugs:spotbugs-maven-plugin:check \
-              org.apache.maven.plugins:maven-pmd-plugin:check || true
+              org.apache.maven.plugins:maven-pmd-plugin:check
+          echo "exit_code=$?" >> "$GITHUB_OUTPUT"
 
       - name: Upload SpotBugs / PMD reports
         uses: actions/upload-artifact@v4
@@ -162,28 +171,78 @@ jobs:
           retention-days: 7
 
   # ------------------------------------------------------------------
-  # 5. Quality Gate summary (optional - fails the workflow if critical issues)
+  # 5. Quality Gate: reads reports, fails on critical findings
   # ------------------------------------------------------------------
   quality-gate:
     name: Quality Gate
     runs-on: ubuntu-latest
-    needs: [build-and-test, sast-codeql, sca-dependency-check]
+    needs: [build-and-test, sast-codeql, sca-dependency-check, static-analysis]
     if: always()
     steps:
-      - name: Check previous job results
+      - name: Download SCA report
+        uses: actions/download-artifact@v4
+        with:
+          name: dependency-check-report
+          path: ./gate-reports/sca
+        continue-on-error: true
+
+      - name: Download static analysis reports
+        uses: actions/download-artifact@v4
+        with:
+          name: static-analysis-reports
+          path: ./gate-reports/static
+        continue-on-error: true
+
+      - name: Evaluate quality gate from reports
         run: |
-          echo "Build & Test: ${{ needs.build-and-test.result }}"
-          echo "CodeQL:       ${{ needs.sast-codeql.result }}"
-          echo "SCA:          ${{ needs.sca-dependency-check.result }}"
+          python3 - <<'PY'
+          import json, glob, sys, xml.etree.ElementTree as ET
 
-          if [[ "${{ needs.build-and-test.result }}" == "failure" ]]; then
-            echo "::error::Build or tests failed"
-            exit 1
-          fi
+          failures = []
 
-          if [[ "${{ needs.sast-codeql.result }}" == "failure" ]]; then
-            echo "::error::CodeQL found high-severity security issues"
-            exit 1
-          fi
+          # 1) Dependency-Check JSON: count CVSS >= 7.0
+          for f in glob.glob('./gate-reports/sca/dependency-check-report.json'):
+              data = json.load(open(f))
+              crit = []
+              for dep in data.get('dependencies', []):
+                  for v in dep.get('vulnerabilities', []) or []:
+                      try:
+                          score = float(v.get('cvssv3', {}).get('baseScore') or v.get('cvssv2', {}).get('score') or 0)
+                      except (TypeError, ValueError):
+                          score = 0
+                      if score >= 7.0:
+                          crit.append((dep.get('fileName'), v.get('name'), score))
+              print(f'SCA: {len(crit)} hallazgos con CVSS>=7')
+              for c in crit[:20]:
+                  print(f'  - {c[0]} {c[1]} CVSS={c[2]}')
+              if crit:
+                  failures.append(f'SCA: {len(crit)} vulnerabilidades CVSS>=7')
 
-          echo "Quality gate passed"
+          # 2) SpotBugs XML: high-priority bugs
+          for f in glob.glob('./gate-reports/static/spotbugsXml.xml'):
+              root = ET.parse(f).getroot()
+              bugs = root.findall('BugInstance')
+              high = [b for b in bugs if b.get('priority') == '1']
+              print(f'SpotBugs: {len(bugs)} bugs totales, {len(high)} prioridad alta')
+              if high:
+                  failures.append(f'SpotBugs: {len(high)} bugs de prioridad alta')
+
+          # 3) Previous job results (build/tests/SAST/SCA/static)
+          import os
+          for name, res in {
+              'build-and-test': '${{ needs.build-and-test.result }}',
+              'sast-codeql': '${{ needs.sast-codeql.result }}',
+              'sca-dependency-check': '${{ needs.sca-dependency-check.result }}',
+              'static-analysis': '${{ needs.static-analysis.result }}',
+          }.items():
+              print(f'{name}: {res}')
+          if '${{ needs.build-and-test.result }}' == 'failure':
+              failures.append('Build o tests fallaron')
+
+          if failures:
+              print('::error::Quality gate FAILED:')
+              for f_ in failures:
+                  print(f'::error::{f_}')
+              sys.exit(1)
+          print('Quality gate passed: sin hallazgos criticos en reportes')
+          PY
