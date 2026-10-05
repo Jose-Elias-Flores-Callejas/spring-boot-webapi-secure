@@ -1,0 +1,16 @@
+{
+  "number": 1,
+  "title": "security: quality gate estricto + SCA activado",
+  "state": "open",
+  "mergeable": true,
+  "mergeable_state": "blocked",
+  "draft": false,
+  "base": {
+    "ref": "main"
+  },
+  "head": {
+    "ref": "feature/devsecops-lab"
+  },
+  "html_url": "https://github.com/Jose-Elias-Flores-Callejas/spring-boot-webapi-secure/pull/1",
+  "_nota": "mergeable_state=blocked: merge bloqueado por checks requeridos en rojo (Quality Gate)"
+}
