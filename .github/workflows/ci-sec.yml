@@ -203,8 +203,13 @@ jobs:
 
           failures = []
 
+          # 0) Fail-closed: sin reporte SCA no se puede validar -> falla
+          sca_reports = glob.glob('./gate-reports/sca/dependency-check-report.json')
+          if not sca_reports:
+              failures.append('SCA sin reporte: Dependency-Check no genero evidencia (fail-closed)')
+
           # 1) Dependency-Check JSON: count CVSS >= 7.0
-          for f in glob.glob('./gate-reports/sca/dependency-check-report.json'):
+          for f in sca_reports:
               data = json.load(open(f))
               crit = []
               for dep in data.get('dependencies', []):
